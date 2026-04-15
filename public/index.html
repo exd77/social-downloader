@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Social DL — Download from any platform</title>
+    <meta name="description" content="Download videos, images, and audio from TikTok, YouTube, Instagram, Pinterest, Twitter/X, Facebook, Douyin, CapCut, and Apple Music. Fast, free, no watermark." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/css/style.css" />
+  </head>
+  <body>
+    <nav class="navbar">
+      <a href="/" class="nav-brand">
+        <span class="brand-icon">⬇</span>
+        <span class="brand-text">Social<span class="brand-accent">DL</span></span>
+      </a>
+      <div class="nav-links">
+        <a href="#platforms" class="nav-link">Platforms</a>
+        <a href="#history" class="nav-link">History</a>
+      </div>
+    </nav>
+
+    <main class="main">
+      <section class="hero">
+        <div class="hero-badge">Free &amp; Unlimited — No login required</div>
+        <h1>Download anything,<br /><span class="hero-highlight">from anywhere.</span></h1>
+        <p class="hero-sub">
+          Paste a link. Get your video, image, or audio in seconds. including TikTok, YouTube, Instagram, and more.
+        </p>
+      </section>
+
+      <section class="downloader" id="downloader">
+        <div class="dl-input-row">
+          <div class="dl-input-group">
+            <svg class="dl-input-icon" viewBox="0 0 20 20" fill="none"><path d="M12.586 4.586a2 2 0 1 1 2.828 2.828l-3 3a2 2 0 0 1-2.828 0 1 1 0 0 0-1.414 1.414 4 4 0 0 0 5.656 0l3-3a4 4 0 0 0-5.656-5.656l-1.5 1.5a1 1 0 1 0 1.414 1.414l1.5-1.5zM7.414 15.414a2 2 0 1 1-2.828-2.828l3-3a2 2 0 0 1 2.828 0 1 1 0 0 0 1.414-1.414 4 4 0 0 0-5.656 0l-3 3a4 4 0 0 0 5.656 5.656l1.5-1.5a1 1 0 1 0-1.414-1.414l-1.5 1.5z" fill="currentColor"/></svg>
+            <input id="urlInput" type="url" placeholder="Paste a TikTok, YouTube, Instagram, or any supported link..." autocomplete="off" />
+            <button id="pasteButton" class="btn-paste" type="button">
+              <svg viewBox="0 0 20 20" fill="none" width="16" height="16"><path d="M8 3a1 1 0 0 1 1-1h2a1 1 0 1 1 0 2H9a1 1 0 0 1-1-1z" fill="currentColor"/><path d="M6 3a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h8a3 3 0 0 0 3-3V6a3 3 0 0 0-3-3H6z" fill="currentColor" opacity="0.3"/></svg>
+              Paste
+            </button>
+          </div>
+        </div>
+
+        <div class="dl-options">
+          <div class="dl-detect">
+            <span class="dl-detect-dot"></span>
+            <span id="platformIndicator" class="dl-detect-text">Waiting for URL...</span>
+          </div>
+          <label class="dl-quality">
+            <select id="qualitySelect">
+              <option value="">Best quality</option>
+              <option value="360p">360p</option>
+              <option value="480p">480p</option>
+              <option value="720p">720p</option>
+              <option value="1080p">1080p</option>
+            </select>
+          </label>
+        </div>
+
+        <button id="downloadButton" class="btn-download" type="button">
+          <span class="button-text">Download</span>
+          <span class="spinner hidden"></span>
+        </button>
+      </section>
+
+      <section id="resultSection" class="result-section"></section>
+
+      <section class="platforms-section" id="platforms">
+        <div class="section-header">
+          <h2>Supported Platforms</h2>
+        </div>
+        <div id="platformGrid" class="platform-grid"></div>
+      </section>
+
+      <section class="history-section" id="history">
+        <div class="section-header">
+          <h2>Recent Downloads</h2>
+          <span class="section-badge">Local</span>
+        </div>
+        <div id="historyList" class="history-list"></div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        <span class="footer-brand">Social<span class="brand-accent">DL</span></span>
+        <span class="footer-copy">Free social media downloader. No data stored on our servers.</span>
+      </div>
+    </footer>
+
+    <div id="toastContainer" class="toast-container"></div>
+    <script src="/js/app.js"></script>
+  </body>
+</html>
