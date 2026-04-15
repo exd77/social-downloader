@@ -9,6 +9,8 @@ const ytDlp = require("yt-dlp-exec");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { execFile } = require("child_process");
+const { promisify } = require("util");
 
 const app = express();
 const PORT = 3000;
@@ -20,6 +22,10 @@ const TEMP_TTL = 30 * 60 * 1000;
 const TEMP_ROOT = path.join(os.tmpdir(), "social-dl");
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+const DEFAULT_COOKIES_FILE = "/root/wangsaf/cookies.txt";
+const YTDLP_COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || (fs.existsSync(DEFAULT_COOKIES_FILE) ? DEFAULT_COOKIES_FILE : null);
+const FERDEV_API_KEY = process.env.FERDEV_API_KEY || "RS-uy99r32nan";
+const execFileAsync = promisify(execFile);
 
 fs.mkdirSync(TEMP_ROOT, { recursive: true });
 
@@ -99,7 +105,7 @@ const platformDefinitions = [
   },
   {
     key: "facebook",
-    name: "Facebook Reels",
+    name: "Facebook",
     typeLabel: "Video",
     patterns: [/facebook\.com/i, /fb\.watch/i],
   },
@@ -171,8 +177,34 @@ function normalizeUrl(url, platform) {
   let normalized = String(url || "").trim();
 
   if (platform === "instagram") {
-    normalized = normalized.replace("instagr.am", "www.instagram.com");
-    normalized = normalized.replace("/reels/", "/reel/");
+    try {
+      const u = new URL(normalized);
+      u.protocol = "https:";
+      u.hostname = "www.instagram.com";
+      u.hash = "";
+
+      // Normalize path variants
+      let p = u.pathname.replace(/\/reels\//i, "/reel/");
+      if (!p.endsWith("/")) p += "/";
+      u.pathname = p;
+
+      // Keep only param that can be relevant for carousel posts
+      const keep = new URLSearchParams();
+      if (u.searchParams.has("img_index")) {
+        keep.set("img_index", u.searchParams.get("img_index"));
+      }
+      u.search = keep.toString() ? `?${keep.toString()}` : "";
+
+      normalized = u.toString();
+    } catch {
+      normalized = normalized.replace("instagr.am", "www.instagram.com").replace("/reels/", "/reel/");
+    }
+  }
+
+  if (platform === "facebook") {
+    normalized = normalized
+      .replace("https://web.facebook.com", "https://www.facebook.com")
+      .replace("https://m.facebook.com", "https://www.facebook.com");
   }
 
   return normalized;
@@ -191,8 +223,70 @@ function getPlatformMeta(platform) {
   return platformDefinitions.find((entry) => entry.key === platform) || null;
 }
 
+function isUrlCompatibleWithPlatform(url, platform) {
+  const meta = getPlatformMeta(platform);
+  if (!meta) return false;
+
+  const matchesPattern = meta.patterns.some((pattern) => pattern.test(url));
+  if (!matchesPattern) return false;
+
+  if (platform === "youtube-shorts") {
+    return /youtube\.com\/shorts\//i.test(url) || /youtu\.be\//i.test(url);
+  }
+
+  if (platform === "youtube") {
+    return /youtube\.com/i.test(url) || /youtu\.be/i.test(url);
+  }
+
+  return true;
+}
+
+function isYtAuthChallenge(text) {
+  const lowered = String(text || "").toLowerCase();
+  return (
+    lowered.includes("sign in to confirm") ||
+    lowered.includes("account authentication is required") ||
+    lowered.includes("cookies") ||
+    lowered.includes("not a bot") ||
+    lowered.includes("please log in")
+  );
+}
+
+function normalizeYtDlpError(error) {
+  const raw = String(error?.stderr || error?.stdout || error?.message || "Download failed.");
+  const lowered = raw.toLowerCase();
+
+  if (isYtAuthChallenge(lowered)) {
+    if (lowered.includes("instagram")) {
+      return "Instagram sedang membatasi akses automated request (login/challenge). Coba link Reel publik lain atau tunggu beberapa menit lalu retry.";
+    }
+    return "YouTube blocked automated access for this video (bot/cookie challenge). Coba video Shorts lain atau gunakan link publik tanpa age/login restriction.";
+  }
+
+  if (lowered.includes("private video") || lowered.includes("login required")) {
+    return "Video ini private / butuh login, jadi belum bisa diunduh.";
+  }
+
+  if (lowered.includes("video unavailable") || lowered.includes("not available")) {
+    return "Video tidak tersedia atau sudah dihapus.";
+  }
+
+  if (lowered.includes("cannot parse data") || lowered.includes("extractor error")) {
+    return "Extractor provider lagi error untuk link ini. Coba lagi bentar atau pakai URL Facebook publik lain.";
+  }
+
+  return raw.split("\n")[0].trim().slice(0, 300) || "Download failed.";
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&#x2F;/g, "/")
+    .replace(/&#47;/g, "/");
+}
+
 function buildProxyUrl(url, filename) {
-  const params = new URLSearchParams({ url });
+  const params = new URLSearchParams({ url: decodeHtmlEntities(url) });
   if (filename) {
     params.set("filename", filename);
   }
@@ -222,13 +316,16 @@ function cleanupTempFiles() {
 
 setInterval(cleanupTempFiles, 5 * 60 * 1000).unref();
 
-async function createTempDownload(url, outputExtension = "bin", filenameBase = "download") {
+async function downloadToTempFile(url, extension = "bin", requestHeaders = {}) {
   const tempId = uuidv4();
-  const filePath = path.join(TEMP_ROOT, `${tempId}.${outputExtension}`);
+  const filePath = path.join(TEMP_ROOT, `${tempId}.${extension}`);
   const writer = fs.createWriteStream(filePath);
-  const response = await http.get(url, { responseType: "stream" });
-  let totalBytes = 0;
+  const response = await http.get(url, {
+    responseType: "stream",
+    headers: requestHeaders,
+  });
 
+  let totalBytes = 0;
   await new Promise((resolve, reject) => {
     response.data.on("data", (chunk) => {
       totalBytes += chunk.length;
@@ -242,14 +339,119 @@ async function createTempDownload(url, outputExtension = "bin", filenameBase = "
     response.data.pipe(writer);
   });
 
-  return registerTempFile(filePath, `${filenameBase}.${outputExtension}`, response.headers["content-type"]);
+  return { filePath, contentType: response.headers["content-type"] || "application/octet-stream" };
+}
+
+async function createTempDownload(url, outputExtension = "bin", filenameBase = "download") {
+  const { filePath, contentType } = await downloadToTempFile(url, outputExtension);
+  return registerTempFile(filePath, `${filenameBase}.${outputExtension}`, contentType);
+}
+
+function parseDashRepresentations(dashXml) {
+  const list = [];
+  const repRegex = /<Representation\b([^>]*)>([\s\S]*?)<\/Representation>/gi;
+  let match;
+
+  while ((match = repRegex.exec(dashXml))) {
+    const attrs = match[1] || "";
+    const body = match[2] || "";
+    const mimeType = (attrs.match(/mimeType="([^"]+)"/i)?.[1] || "").toLowerCase();
+    const bandwidth = Number(attrs.match(/bandwidth="(\d+)"/i)?.[1] || 0);
+    const baseUrl = body.match(/<BaseURL>([^<]+)<\/BaseURL>/i)?.[1] || "";
+    if (!baseUrl) continue;
+
+    list.push({
+      mimeType,
+      bandwidth,
+      url: decodeHtmlEntities(baseUrl),
+    });
+  }
+
+  const videos = list.filter((x) => x.mimeType.includes("video/mp4")).sort((a, b) => b.bandwidth - a.bandwidth);
+  const audios = list.filter((x) => x.mimeType.includes("audio/mp4")).sort((a, b) => b.bandwidth - a.bandwidth);
+
+  return {
+    bestVideo: videos[0] || null,
+    bestAudio: audios[0] || null,
+  };
+}
+
+async function tryFacebookDashMerge(url, title = "Facebook Reel") {
+  const pageResp = await http.get(url, {
+    headers: {
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      Referer: "https://www.facebook.com/",
+    },
+  });
+
+  const html = String(pageResp.data || "");
+  const manifestMatch = html.match(/"dash_manifest":"([^"]+)"/i);
+  if (!manifestMatch?.[1]) {
+    throw new Error("DASH manifest not found");
+  }
+
+  let dashXml = "";
+  try {
+    dashXml = JSON.parse(`"${manifestMatch[1]}"`);
+  } catch {
+    dashXml = manifestMatch[1]
+      .replace(/\\u003C/g, "<")
+      .replace(/\\u003E/g, ">")
+      .replace(/\\u0026/g, "&")
+      .replace(/\\\//g, "/")
+      .replace(/\\"/g, '"');
+  }
+
+  const { bestVideo, bestAudio } = parseDashRepresentations(dashXml);
+  if (!bestVideo || !bestAudio) {
+    throw new Error("No suitable DASH audio/video streams found");
+  }
+
+  const videoFile = await downloadToTempFile(bestVideo.url, "mp4", { Referer: "https://www.facebook.com/" });
+  const audioFile = await downloadToTempFile(bestAudio.url, "m4a", { Referer: "https://www.facebook.com/" });
+
+  const outputPath = path.join(TEMP_ROOT, `${uuidv4()}.mp4`);
+  try {
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-i",
+      videoFile.filePath,
+      "-i",
+      audioFile.filePath,
+      "-c:v",
+      "copy",
+      "-c:a",
+      "aac",
+      "-movflags",
+      "+faststart",
+      outputPath,
+    ]);
+  } finally {
+    fs.promises.unlink(videoFile.filePath).catch(() => {});
+    fs.promises.unlink(audioFile.filePath).catch(() => {});
+  }
+
+  return {
+    success: true,
+    platform: "facebook",
+    title: safeTitle(title, "Facebook Reel"),
+    type: "video",
+    thumbnail: null,
+    downloadUrl: registerTempFile(outputPath, "facebook-reel.mp4", "video/mp4"),
+  };
 }
 
 function safeTitle(title, fallback) {
-  return String(title || fallback || "Untitled")
+  const cleaned = String(title || "")
     .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+
+  if (!cleaned || /^unknown$/i.test(cleaned) || /^untitled$/i.test(cleaned)) {
+    return String(fallback || "Untitled");
+  }
+
+  return cleaned;
 }
 
 async function fetchTikwm(url) {
@@ -310,13 +512,17 @@ async function ytDlpMetadata(url, options = {}) {
     noPlaylist: true,
     skipDownload: true,
     addHeader: [`User-Agent:${USER_AGENT}`],
+    cookies: options.cookies,
     ...options,
   };
 
   return ytDlp(url, args);
 }
 
-async function ytDlpToTemp(url, { format, filenameBase, remuxVideo, extractAudio, audioFormat } = {}) {
+async function ytDlpToTemp(
+  url,
+  { format, filenameBase, remuxVideo, extractAudio, audioFormat, extractorArgs, retries, cookies } = {}
+) {
   const tempId = uuidv4();
   const outputTemplate = path.join(TEMP_ROOT, `${tempId}.%(ext)s`);
 
@@ -330,6 +536,9 @@ async function ytDlpToTemp(url, { format, filenameBase, remuxVideo, extractAudio
     audioFormat,
     maxFilesize: "500M",
     addHeader: [`User-Agent:${USER_AGENT}`],
+    extractorArgs,
+    retries,
+    cookies,
     output: outputTemplate,
   });
 
@@ -359,6 +568,49 @@ function selectYoutubeFormat(quality) {
     "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
   };
   return map[quality] || "bestvideo+bestaudio/best";
+}
+
+function getYoutubeShortsCandidates(rawUrl) {
+  const candidates = [];
+  const seen = new Set();
+
+  const pushUnique = (url) => {
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    candidates.push(url);
+  };
+
+  pushUnique(String(rawUrl || "").trim());
+
+  try {
+    const parsed = new URL(rawUrl);
+    if (/youtu\.be$/i.test(parsed.hostname)) {
+      const id = parsed.pathname.replace(/^\/+/, "").split("/")[0];
+      if (id) {
+        pushUnique(`https://www.youtube.com/shorts/${id}`);
+        pushUnique(`https://www.youtube.com/watch?v=${id}`);
+      }
+      return candidates;
+    }
+
+    const shortsMatch = parsed.pathname.match(/\/shorts\/([^/?#&]+)/i);
+    if (shortsMatch?.[1]) {
+      const id = shortsMatch[1];
+      pushUnique(`https://www.youtube.com/shorts/${id}`);
+      pushUnique(`https://www.youtube.com/watch?v=${id}`);
+      return candidates;
+    }
+
+    const watchId = parsed.searchParams.get("v");
+    if (watchId) {
+      pushUnique(`https://www.youtube.com/watch?v=${watchId}`);
+      pushUnique(`https://www.youtube.com/shorts/${watchId}`);
+    }
+  } catch (_) {
+    // ignore malformed candidate derivation
+  }
+
+  return candidates;
 }
 
 async function handleTikTok(url, platform) {
@@ -422,25 +674,110 @@ async function handleCobaltVideo(url, platform, fallbackOptions = {}) {
 }
 
 async function handleYtDlp(url, platform, options = {}) {
-  const metadata = await ytDlpMetadata(url, { format: options.format });
-  const title = safeTitle(metadata.title, `${platform} download`);
-  const thumbnail = metadata.thumbnail || null;
-  const downloadUrl = await ytDlpToTemp(url, {
-    format: options.format,
-    filenameBase: title,
-    remuxVideo: options.remuxVideo,
-    extractAudio: options.extractAudio,
-    audioFormat: options.audioFormat,
-  });
+  let metadata = null;
+  let title = safeTitle(null, `${platform} download`);
+  let thumbnail = null;
 
-  return {
-    success: true,
-    platform,
-    title,
-    type: options.extractAudio ? "audio" : "video",
-    thumbnail,
-    downloadUrl,
+  const baseOptions = {
+    format: options.format,
+    extractorArgs: options.extractorArgs,
+    retries: options.retries ?? 2,
   };
+
+  let metadataErrorRef = null;
+  try {
+    metadata = await ytDlpMetadata(url, baseOptions);
+    title = safeTitle(metadata?.title, `${platform} download`);
+    thumbnail = metadata?.thumbnail || null;
+  } catch (metadataError) {
+    metadataErrorRef = metadataError;
+    logDownload("yt-dlp metadata failed, continuing with download", {
+      platform,
+      error: normalizeYtDlpError(metadataError),
+    });
+  }
+
+  let lastDownloadError = null;
+
+  try {
+    const downloadUrl = await ytDlpToTemp(url, {
+      ...baseOptions,
+      filenameBase: title,
+      remuxVideo: options.remuxVideo,
+      extractAudio: options.extractAudio,
+      audioFormat: options.audioFormat,
+    });
+
+    return {
+      success: true,
+      platform,
+      title,
+      type: options.extractAudio ? "audio" : "video",
+      thumbnail,
+      downloadUrl,
+    };
+  } catch (downloadError) {
+    lastDownloadError = downloadError;
+  }
+
+  const firstRaw = String(
+    lastDownloadError?.stderr ||
+      lastDownloadError?.stdout ||
+      metadataErrorRef?.stderr ||
+      metadataErrorRef?.stdout ||
+      lastDownloadError?.message ||
+      metadataErrorRef?.message ||
+      ""
+  );
+
+  const shouldRetryWithCookies =
+    YTDLP_COOKIES_FILE &&
+    (isYtAuthChallenge(firstRaw) || ["youtube", "youtube-shorts", "facebook", "instagram", "twitter"].includes(platform));
+
+  if (shouldRetryWithCookies) {
+    logDownload("yt-dlp retrying with cookies", {
+      platform,
+      cookiesFile: YTDLP_COOKIES_FILE,
+    });
+
+    try {
+      const metadataWithCookies = await ytDlpMetadata(url, {
+        ...baseOptions,
+        cookies: YTDLP_COOKIES_FILE,
+      });
+      title = safeTitle(metadataWithCookies?.title, `${platform} download`);
+      thumbnail = metadataWithCookies?.thumbnail || thumbnail;
+    } catch (metaCookieErr) {
+      logDownload("yt-dlp metadata with cookies failed, continuing", {
+        platform,
+        error: normalizeYtDlpError(metaCookieErr),
+      });
+    }
+
+    try {
+      const downloadUrl = await ytDlpToTemp(url, {
+        ...baseOptions,
+        filenameBase: title,
+        remuxVideo: options.remuxVideo,
+        extractAudio: options.extractAudio,
+        audioFormat: options.audioFormat,
+        cookies: YTDLP_COOKIES_FILE,
+      });
+
+      return {
+        success: true,
+        platform,
+        title,
+        type: options.extractAudio ? "audio" : "video",
+        thumbnail,
+        downloadUrl,
+      };
+    } catch (cookieDownloadError) {
+      throw new Error(normalizeYtDlpError(cookieDownloadError));
+    }
+  }
+
+  throw new Error(normalizeYtDlpError(lastDownloadError || metadataErrorRef));
 }
 
 async function handleInstagram(url) {
@@ -450,7 +787,39 @@ async function handleInstagram(url) {
     : normalizedUrl.includes("/p/")
       ? "Post"
       : "Reel";
-  const result = await handleCobaltVideo(normalizedUrl, "instagram");
+
+  // Primary: Ferdev IG endpoints (works for many shared links)
+  try {
+    const endpoint = type === "Story" ? "igstory" : "instagram";
+    const apiUrl = `https://api.ferdev.my.id/downloader/${endpoint}?link=${encodeURIComponent(normalizedUrl)}&apikey=${FERDEV_API_KEY}`;
+    const response = await http.get(apiUrl, { headers: { Accept: "application/json" } });
+    const data = response?.data?.data || response?.data?.result || response?.data;
+    const mediaUrl = data?.url || data?.video || data?.download || data?.dlink || data?.link;
+
+    if (mediaUrl) {
+      return {
+        success: true,
+        platform: "instagram",
+        title: safeTitle(data?.title || data?.caption, `Instagram ${type}`),
+        type: "video",
+        thumbnail: data?.thumbnail || null,
+        contentTypeLabel: type,
+        downloadUrl: buildProxyUrl(mediaUrl, `instagram-${type.toLowerCase()}.mp4`),
+      };
+    }
+    throw new Error("Ferdev: no media URL found");
+  } catch (ferdevError) {
+    logDownload("Instagram Ferdev failed, fallback engaged", {
+      error: ferdevError?.message || String(ferdevError),
+    });
+  }
+
+  // Fallback: Cobalt -> yt-dlp (yt-dlp will retry with cookies when needed)
+  const result = await handleCobaltVideo(normalizedUrl, "instagram", {
+    remuxVideo: "mp4",
+    format: "bestvideo[height<=1080]+bestaudio/best",
+    retries: 3,
+  });
   result.contentTypeLabel = type;
   return result;
 }
@@ -557,41 +926,141 @@ async function handleTwitter(url) {
 }
 
 async function handleFacebook(url) {
-  const response = await http.get(
-    `https://api.gimita.id/api/downloader/facebook?url=${encodeURIComponent(url)}`
-  );
-  const result = response.data;
-  if (!result?.success || !result?.data) {
-    throw new Error(result?.message || "Facebook media unavailable.");
+  const normalized = normalizeUrl(url, "facebook");
+
+  // Primary: Gimita API
+  try {
+    const response = await http.get(
+      `https://api.gimita.id/api/downloader/facebook?url=${encodeURIComponent(normalized)}`,
+      {
+        headers: {
+          Accept: "application/json",
+          Referer: "https://www.facebook.com/",
+        },
+      }
+    );
+
+    const result = response.data;
+    if (!result?.success || !result?.data) {
+      throw new Error(result?.message || "Facebook media unavailable.");
+    }
+
+    const qualities = Array.isArray(result.data.all_qualities) ? result.data.all_qualities : [];
+    const preferred =
+      qualities.find((entry) => /hd|1080|720/i.test(entry?.resolution || entry?.quality || entry?.label || "")) ||
+      qualities[0];
+
+    const mediaUrl = preferred?.url || result.data.best_url || result.data.url || result.data.download;
+    if (!mediaUrl) {
+      throw new Error("No Facebook download URL found.");
+    }
+
+    return {
+      success: true,
+      platform: "facebook",
+      title: safeTitle(result.data.title || result.data.caption, "Facebook Reel"),
+      type: "video",
+      thumbnail: result.data.thumbnail || null,
+      downloadUrl: buildProxyUrl(mediaUrl, "facebook-reel.mp4"),
+    };
+  } catch (primaryError) {
+    logDownload("Facebook Gimita failed, fallback engaged", {
+      error: primaryError?.message || String(primaryError),
+    });
   }
 
-  const qualities = Array.isArray(result.data.all_qualities) ? result.data.all_qualities : [];
-  const preferred =
-    qualities.find((entry) => /hd|1080|720/i.test(entry.quality || entry.label || "")) ||
-    qualities[0];
-  const mediaUrl = preferred?.url || result.data.best_url;
-
-  if (!mediaUrl) {
-    throw new Error("No Facebook download URL found.");
+  // Fallback #2: direct DASH parse + merge audio/video via ffmpeg
+  try {
+    return await tryFacebookDashMerge(normalized, "Facebook Reel");
+  } catch (dashError) {
+    logDownload("Facebook DASH merge failed, fallback engaged", {
+      error: dashError?.message || String(dashError),
+    });
   }
 
-  return {
-    success: true,
-    platform: "facebook",
-    title: safeTitle(result.data.title, "Facebook Reel"),
-    type: "video",
-    thumbnail: result.data.thumbnail || null,
-    downloadUrl: buildProxyUrl(mediaUrl, "facebook-reel.mp4"),
-  };
+  // Fallback #3: yt-dlp direct (prefer merged audio+video)
+  try {
+    return await handleYtDlp(normalized, "facebook", {
+      remuxVideo: "mp4",
+      format: "bestvideo[height<=1080]+bestaudio/best[ext=mp4]/best",
+      retries: 3,
+    });
+  } catch (ytError) {
+    logDownload("Facebook yt-dlp failed, fallback engaged", {
+      error: ytError?.message || String(ytError),
+    });
+  }
+
+  // Fallback #4: Ferdev API (note: some links may return video-only stream)
+  try {
+    const ferdevUrl = `https://api.ferdev.my.id/downloader/facebook?link=${encodeURIComponent(normalized)}&apikey=${FERDEV_API_KEY}`;
+    const ferdevResponse = await http.get(ferdevUrl, {
+      headers: {
+        Accept: "application/json",
+      },
+    });
+
+    const data = ferdevResponse?.data?.data || ferdevResponse?.data;
+    const mediaUrl = data?.sd || data?.hd || data?.url || data?.download;
+
+    if (mediaUrl) {
+      const cleanedMediaUrl = decodeHtmlEntities(mediaUrl);
+      const isDirectFriendly = /(?:snapcdn\.app|fbcdn\.net)/i.test(cleanedMediaUrl);
+      return {
+        success: true,
+        platform: "facebook",
+        title: safeTitle(data?.title || data?.caption, "Facebook Reel"),
+        type: "video",
+        thumbnail: data?.thumbnail || null,
+        warning: "Fallback source used. Some Facebook sources may have no audio.",
+        downloadUrl: isDirectFriendly ? cleanedMediaUrl : buildProxyUrl(cleanedMediaUrl, "facebook-reel.mp4"),
+      };
+    }
+
+    throw new Error("Ferdev: no media URL found");
+  } catch (ferdevError) {
+    logDownload("Facebook Ferdev failed", {
+      error: ferdevError?.message || String(ferdevError),
+    });
+  }
+
+  throw new Error("Semua fallback Facebook gagal untuk link ini.");
 }
 
 async function handleYoutube(url, quality) {
   const format = selectYoutubeFormat(quality);
-  return handleCobaltVideo(url, "youtube", { format, remuxVideo: "mp4" });
+  return handleCobaltVideo(url, "youtube", {
+    format,
+    remuxVideo: "mp4",
+    extractorArgs: ["youtube:player_client=android,web"],
+    retries: 3,
+  });
 }
 
 async function handleYoutubeShorts(url) {
-  return handleCobaltVideo(url, "youtube-shorts", { remuxVideo: "mp4" });
+  const candidates = getYoutubeShortsCandidates(url);
+  const fallbackOptions = {
+    remuxVideo: "mp4",
+    format: "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]/best",
+    extractorArgs: ["youtube:player_client=android,web"],
+    retries: 3,
+  };
+
+  let lastErr = null;
+  for (const candidate of candidates) {
+    try {
+      logDownload("Trying YouTube Shorts candidate", { candidate });
+      return await handleCobaltVideo(candidate, "youtube-shorts", fallbackOptions);
+    } catch (err) {
+      lastErr = err;
+      logDownload("YouTube Shorts candidate failed", {
+        candidate,
+        error: normalizeYtDlpError(err),
+      });
+    }
+  }
+
+  throw new Error(normalizeYtDlpError(lastErr));
 }
 
 async function handleCapcut(url) {
@@ -686,6 +1155,13 @@ app.post("/api/download", async (req, res) => {
     return res.status(400).json({ success: false, error: "Unsupported or unrecognized platform URL." });
   }
 
+  if (!isUrlCompatibleWithPlatform(inputUrl, platform)) {
+    return res.status(400).json({
+      success: false,
+      error: `URL tidak cocok dengan platform ${platform}. Cek lagi link yang lo paste.`,
+    });
+  }
+
   const normalizedUrl = normalizeUrl(inputUrl, platform);
 
   try {
@@ -695,12 +1171,20 @@ app.post("/api/download", async (req, res) => {
   } catch (error) {
     const message = error.response?.data?.message || error.message || "Download failed.";
     const lowered = message.toLowerCase();
+    const ytDlpFriendly = normalizeYtDlpError(error);
+
+    const isYoutubeFamily = platform === "youtube" || platform === "youtube-shorts";
+
     const publicMessage =
-      lowered.includes("private") || lowered.includes("login")
-        ? "This content appears to be private or requires login."
-        : lowered.includes("404") || lowered.includes("deleted") || lowered.includes("not found")
-          ? "This content appears to be unavailable or deleted."
-          : message;
+      platform === "instagram" && (lowered.includes("private") || lowered.includes("login"))
+        ? "Instagram link ini kebaca private / butuh login. Coba pakai link Reel publik (tanpa close-friends / private account)."
+        : !isYoutubeFamily && (lowered.includes("private") || lowered.includes("login"))
+          ? "This content appears to be private or requires login."
+          : lowered.includes("530")
+            ? "Provider Facebook lagi gangguan (HTTP 530). Coba lagi bentar atau pakai link Facebook publik lain."
+            : lowered.includes("404") || lowered.includes("deleted") || lowered.includes("not found")
+              ? "This content appears to be unavailable or deleted."
+              : ytDlpFriendly;
 
     logDownload("Download failed", { platform, error: publicMessage });
     return res.status(500).json({ success: false, platform, error: publicMessage });
@@ -728,15 +1212,23 @@ app.get("/api/fetch", async (req, res) => {
 
   const targetUrl = String(req.query.url || "");
   const filename = safeTitle(req.query.filename, "download");
+  const customReferer = String(req.query.referer || "").trim();
 
   if (!validateUrl(targetUrl)) {
     return res.status(400).json({ success: false, error: "Invalid fetch URL." });
   }
 
   try {
+    const parsedTarget = new URL(targetUrl);
     const response = await http.get(targetUrl, {
       responseType: "stream",
-      headers: { Referer: new URL(targetUrl).origin },
+      headers: {
+        Referer: customReferer || parsedTarget.origin,
+        Origin: parsedTarget.origin,
+        Accept: "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+      },
     });
     const contentLength = Number(response.headers["content-length"] || 0);
     if (contentLength > MAX_FILE_SIZE) {
